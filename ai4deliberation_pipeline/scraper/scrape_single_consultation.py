@@ -11,6 +11,8 @@ import requests
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy import create_engine
 from random import uniform
+from urllib.parse import urlparse
+
 
 # Add current directory to path for imports when called from other locations
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -24,6 +26,34 @@ from .utils import get_request_headers
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+def normalize_consultation_url(url):
+    """Normalize URL for matching across http/https and trailing slash differences."""
+    if not url:
+        return None
+    try:
+        parsed = urlparse(url.strip())
+        netloc = parsed.netloc.lower()
+        path = parsed.path or ""
+        if path != "/" and path.endswith("/"):
+            path = path.rstrip("/")
+        query = parsed.query or ""
+        if query:
+            return f"{netloc}{path}?{query}"
+        return f"{netloc}{path}"
+    except Exception:
+        return None
+
+
+def extract_ministry_code_from_url(url):
+    """Extract ministry code from URL path, e.g. '/yme/?p=5739' -> 'yme'."""
+    try:
+        parsed = urlparse((url or "").strip())
+        path_parts = [part for part in parsed.path.strip("/").split("/") if part]
+        return path_parts[0].lower() if path_parts else None
+    except Exception:
+        return None
 
 def scrape_and_store(url, session, selective_update=False, existing_cons=None):
     """Scrape a consultation URL and store all data in the database.
@@ -72,92 +102,100 @@ def scrape_and_store(url, session, selective_update=False, existing_cons=None):
         session.flush()  # Get the ID without committing
     
     # Step 3: Strict consultation existence check
-    # post_id was already validated above
-    post_id = consultation_data['post_id']
-    
-    # STRICT DUPLICATE PREVENTION: Check by URL first (most reliable), then by post_id
-    normalized_url = url.replace('http://', '').replace('https://', '')
-    
-    # Primary check: Look for existing consultation by normalized URL
+    post_id = consultation_data["post_id"]
+
     existing_consultation = None
+    normalized_url = normalize_consultation_url(url)
+
+    # Primary check: normalized URL
     consultations = session.query(Consultation).all()
     for cons in consultations:
-        norm_cons_url = cons.url.replace('http://', '').replace('https://', '')
-        if norm_cons_url == normalized_url:
+        if normalize_consultation_url(cons.url) == normalized_url:
             existing_consultation = cons
             logger.info(f"Found existing consultation by URL match: {cons.title}")
             break
-    
-    # Secondary check: If not found by URL, check by post_id as backup
-    if not existing_consultation:
-        existing_consultation = session.query(Consultation).filter_by(post_id=post_id).first()
-        if existing_consultation:
-            logger.info(f"Found existing consultation by post_id match: {existing_consultation.title}")
-    
+
+    # Secondary check: post_id + ministry code
+    if existing_consultation is None and post_id:
+        target_ministry = extract_ministry_code_from_url(url)
+        post_id_matches = session.query(Consultation).filter_by(post_id=post_id).all()
+
+        ministry_matches = [
+            cons for cons in post_id_matches
+            if extract_ministry_code_from_url(cons.url) == target_ministry
+        ]
+
+        if len(ministry_matches) == 1:
+            existing_consultation = ministry_matches[0]
+            logger.info(
+                f"Found existing consultation by post_id + ministry match: "
+                f"{existing_consultation.title}"
+            )
+        elif len(ministry_matches) > 1:
+            unfinished = [cons for cons in ministry_matches if not cons.is_finished]
+            existing_consultation = unfinished[0] if unfinished else ministry_matches[0]
+            logger.warning(
+                f"Found {len(ministry_matches)} ministry-matching consultations for "
+                f"post_id={post_id}; selected URL={existing_consultation.url}"
+            )
+
     # STRICT HANDLING LOGIC
-    if existing_consultation:
+    if existing_consultation is not None:
         logger.info(f"Consultation already exists: {existing_consultation.title}")
         logger.info(f"  ID: {existing_consultation.id}")
         logger.info(f"  Finished: {existing_consultation.is_finished}")
         logger.info(f"  URL: {existing_consultation.url}")
-        
-        # RULE 1: If consultation is finished, NEVER modify it
+
         if existing_consultation.is_finished:
             logger.warning("⚠️  CONSULTATION IS FINISHED - No updates allowed")
             logger.info("📋 Existing consultation data remains unchanged")
-            
-            # Return consultation ID for reporting but don't modify anything
-            session.commit()  # Commit any pending changes (though there shouldn't be any)
-            
+            session.commit()
+
             if selective_update:
                 return True, {
-                    'new_comments': 0,
-                    'new_documents': 0,
-                    'status_change': False,
-                    'total_comments_change': 0,
-                    'start_message_changed': False,
-                    'end_message_changed': False,
-                    'message': 'Consultation is finished - no updates performed'
+                    "new_comments": 0,
+                    "new_documents": 0,
+                    "status_change": False,
+                    "total_comments_change": 0,
+                    "start_message_changed": False,
+                    "end_message_changed": False,
+                    "message": "Consultation is finished - no updates performed",
                 }
             else:
                 return True, existing_consultation.id
-        
-        # RULE 2: If consultation is unfinished, only update comments and documents
-        logger.info("🔄 CONSULTATION IS UNFINISHED - Checking for new comments and documents")
-        
-        # Update only basic metadata that might change for unfinished consultations
+
+        logger.info("🔄 EXISTING CONSULTATION IS UNFINISHED - Checking for new comments and documents")
+
         old_total_comments = existing_consultation.total_comments or 0
-        existing_consultation.total_comments = consultation_data['total_comments']
-        existing_consultation.end_minister_message = consultation_data['end_minister_message']  # This might be added when consultation finishes
-        
-        # Check if consultation became finished
+        existing_consultation.total_comments = consultation_data["total_comments"]
+        existing_consultation.end_minister_message = consultation_data["end_minister_message"]
+
         was_unfinished = not existing_consultation.is_finished
-        existing_consultation.is_finished = consultation_data['is_finished']
-        
-        if was_unfinished and consultation_data['is_finished']:
+        existing_consultation.is_finished = consultation_data["is_finished"]
+
+        if was_unfinished and consultation_data["is_finished"]:
             logger.info("🏁 Consultation status changed: UNFINISHED → FINISHED")
-        
+
         session.flush()
         consultation = existing_consultation
-        
+
     else:
-        # RULE 3: New consultation - full scrape allowed
         logger.info(f"✅ NEW CONSULTATION - Creating new record: {consultation_data['title']}")
         consultation = Consultation(
-            post_id=consultation_data['post_id'],
-            title=consultation_data['title'],
-            start_minister_message=consultation_data['start_minister_message'],
-            end_minister_message=consultation_data['end_minister_message'],
-            start_date=consultation_data['start_date'],
-            end_date=consultation_data['end_date'],
-            is_finished=consultation_data['is_finished'],
+            post_id=consultation_data["post_id"],
+            title=consultation_data["title"],
+            start_minister_message=consultation_data["start_minister_message"],
+            end_minister_message=consultation_data["end_minister_message"],
+            start_date=consultation_data["start_date"],
+            end_date=consultation_data["end_date"],
+            is_finished=consultation_data["is_finished"],
             url=url,
-            total_comments=consultation_data['total_comments'],
-            accepted_comments=0,  # Initialize to 0, will be updated with actual comment count below
-            ministry_id=ministry.id
+            total_comments=consultation_data["total_comments"],
+            accepted_comments=0,
+            ministry_id=ministry.id,
         )
         session.add(consultation)
-        session.flush()  # Get the ID without committing
+        session.flush()
     
     # Step 4: Create document records
     for doc_data in metadata_result['documents']:

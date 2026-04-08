@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import argparse
 import logging
 import os
 import time
-import argparse
-from random import uniform
-from datetime import datetime
 from collections import defaultdict
+from datetime import datetime
+from random import uniform
 from urllib.parse import urljoin, urlparse
 
 import requests
@@ -17,7 +17,7 @@ from .db_models import Consultation, init_db
 from .scrape_single_consultation import scrape_and_store
 
 # Set up logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 # Constants
@@ -76,7 +76,7 @@ def get_consultation_links_from_page(url):
     logger.info(f"Fetching consultation links from: {url}")
 
     try:
-        response = requests.get(url, timeout=30)
+        response = requests.get(url, timeout=30, allow_redirects=True)
         response.raise_for_status()
 
         soup = BeautifulSoup(response.content, "html.parser")
@@ -104,7 +104,7 @@ def get_consultation_links_from_page(url):
 
                 if not link_element:
                     logger.warning(
-                        f"Could not find a suitable link/title element in list item: "
+                        "Could not find a suitable link/title element in list item: "
                         f"{item.get_text(strip=True)[:100]}..."
                     )
                     continue
@@ -116,11 +116,13 @@ def get_consultation_links_from_page(url):
                 date_span = item.find("span", class_="start")
                 consultation_date = date_span.get_text(strip=True) if date_span else ""
 
-                consultations.append({
-                    "url": consultation_url,
-                    "title": consultation_title,
-                    "date": consultation_date,
-                })
+                consultations.append(
+                    {
+                        "url": consultation_url,
+                        "title": consultation_title,
+                        "date": consultation_date,
+                    }
+                )
 
             except Exception as e:
                 logger.error(f"Error extracting consultation details: {e}")
@@ -246,7 +248,13 @@ def build_existing_indexes(session):
 
 
 def find_existing_consultation(url, post_id, existing_by_url, existing_by_post_id):
-    """Find an existing consultation using URL first, then careful post_id fallback."""
+    """
+    Find an existing consultation using:
+    1. normalized URL
+    2. post_id + ministry code
+
+    Never trust post_id alone, because the same ?p= id can exist under different ministries.
+    """
     normalized_url = normalize_consultation_url(url)
     if normalized_url and normalized_url in existing_by_url:
         return existing_by_url[normalized_url]
@@ -255,26 +263,30 @@ def find_existing_consultation(url, post_id, existing_by_url, existing_by_post_i
         return None
 
     post_id_matches = existing_by_post_id.get(post_id, [])
-    if len(post_id_matches) == 1:
-        return post_id_matches[0]
+    target_ministry = extract_ministry_code_from_url(url)
 
-    if len(post_id_matches) > 1:
-        target_ministry = extract_ministry_code_from_url(url)
-        ministry_matches = [
-            cons for cons in post_id_matches
-            if extract_ministry_code_from_url(cons.url) == target_ministry
-        ]
-        if ministry_matches:
-            chosen = ministry_matches[0]
-        else:
-            unfinished = [cons for cons in post_id_matches if not cons.is_finished]
-            chosen = unfinished[0] if unfinished else post_id_matches[0]
+    ministry_matches = [
+        cons for cons in post_id_matches
+        if extract_ministry_code_from_url(cons.url) == target_ministry
+    ]
 
+    if len(ministry_matches) == 1:
+        return ministry_matches[0]
+
+    if len(ministry_matches) > 1:
+        unfinished = [cons for cons in ministry_matches if not cons.is_finished]
+        chosen = unfinished[0] if unfinished else ministry_matches[0]
         logger.warning(
-            f"Found {len(post_id_matches)} consultations with post_id={post_id}; "
-            f"selected URL={chosen.url}"
+            f"Found {len(ministry_matches)} ministry-matching consultations "
+            f"for post_id={post_id}; selected URL={chosen.url}"
         )
         return chosen
+
+    if post_id_matches:
+        logger.warning(
+            f"Found post_id={post_id} in DB, but only under different ministry/ministries. "
+            f"Treating as new consultation: {url}"
+        )
 
     return None
 

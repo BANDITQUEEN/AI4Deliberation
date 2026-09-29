@@ -6,6 +6,7 @@ import logging
 import urllib.parse
 import unicodedata
 from datetime import datetime
+import requests
 from bs4 import BeautifulSoup
 
 # Set up logging
@@ -103,6 +104,53 @@ def extract_post_id(url):
     except Exception:
         return None
 
+# opengov.gr moved to archive.opengov.gr; older DB rows keep the www host.
+OPENGOV_HOSTS = ('www.opengov.gr', 'opengov.gr', 'archive.opengov.gr')
+
+def opengov_url_key(url):
+    """Host- and scheme-independent key for an opengov URL (e.g. 'minenv/?p=13883')."""
+    if not url:
+        return url
+    parsed = urllib.parse.urlparse(url.strip())
+    if parsed.netloc.lower() not in OPENGOV_HOSTS:
+        return url.strip()
+    key = parsed.path.lstrip('/')
+    if parsed.query:
+        key += '?' + parsed.query
+    return key
+
+def opengov_url_variants(url):
+    """All spellings of an opengov URL across its old and archive hosts, for DB lookups."""
+    key = opengov_url_key(url)
+    if key == (url or '').strip():
+        return [url]
+    return [f"{scheme}://{host}/{key}" for scheme in ('https', 'http') for host in OPENGOV_HOSTS]
+
+# Homepage announcement posts, e.g. archive.opengov.gr/home/2026/07/10/10155
+ANNOUNCEMENT_PATH = re.compile(r'^/home/\d{4}/\d{2}/\d{2}/\d+/?$')
+
+def resolve_announcement_url(url):
+    """The consultation listing sometimes links to a homepage announcement instead of the
+    consultation itself; return the ministry consultation URL it points to, or `url` unchanged."""
+    parsed = urllib.parse.urlparse(url)
+    if parsed.netloc.lower() not in OPENGOV_HOSTS or not ANNOUNCEMENT_PATH.match(parsed.path):
+        return url
+    try:
+        response = requests.get(url, headers=get_request_headers(), timeout=30)
+        response.raise_for_status()
+        post = BeautifulSoup(response.content, 'html.parser').select_one('div.single_post')
+        for a in (post.find_all('a', href=True) if post else []):
+            target = urllib.parse.urljoin(url, a['href'].strip())
+            target_parsed = urllib.parse.urlparse(target)
+            if (target_parsed.netloc.lower() in OPENGOV_HOSTS and '?p=' in target
+                    and not target_parsed.path.startswith('/home/')):
+                logger.info(f"Announcement {url} -> consultation {target}")
+                return target
+        logger.warning(f"Announcement {url} has no consultation link; keeping it as is")
+    except Exception as e:
+        logger.error(f"Could not resolve announcement {url}: {e}")
+    return url
+
 def build_absolute_url(base_url, relative_url):
     """Build an absolute URL from a base URL and a relative URL"""
     return urllib.parse.urljoin(base_url, relative_url)
@@ -117,7 +165,7 @@ def extract_ministry_info(url):
         
         # Try to extract ministry code from URL
         ministry_code = None
-        if hostname.startswith('www.opengov.gr'):
+        if hostname in OPENGOV_HOSTS:
             ministry_code = path_parts[0] if path_parts else None
         else:
             # Handle case where ministry code is in subdomain
@@ -129,7 +177,7 @@ def extract_ministry_info(url):
         
         # Construct ministry base URL
         if ministry_code:
-            ministry_base_url = f"https://www.opengov.gr/{ministry_code}/"
+            ministry_base_url = f"https://{hostname if hostname in OPENGOV_HOSTS else 'archive.opengov.gr'}/{ministry_code}/"
         else:
             ministry_base_url = url[:url.find('?')] if '?' in url else url
             

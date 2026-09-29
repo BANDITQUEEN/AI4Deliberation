@@ -85,7 +85,7 @@ class Comment(Base):
     date = Column(DateTime)
     content = Column(Text, nullable=False)
     extraction_method = Column(String(100))  # Method used for content extraction
-    article_id = Column(Integer, ForeignKey('articles.id'))
+    article_id = Column(Integer, ForeignKey('articles.id'), index=True)
     
     # Relationships
     article = relationship("Article", back_populates="comments")

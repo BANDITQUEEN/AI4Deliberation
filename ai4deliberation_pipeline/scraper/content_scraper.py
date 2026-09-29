@@ -134,7 +134,7 @@ def extract_comments_from_single_page(soup, include_author=False):
     Extract comments from one HTML page only.
     Safer for opengov.gr structure:
     - list: ul.comment_list / ol.comment_list
-    - comment node: li[id^='comment-']
+    - comment node: li[id^='comment-'], including threaded replies nested in ul.children
     """
     comments = []
 
@@ -150,11 +150,13 @@ def extract_comments_from_single_page(soup, include_author=False):
         logger.warning("No comments section found")
         return comments
 
+    # Descendant (not child) selectors so replies (ul.children > li) are collected too;
+    # extract_comment_text strips nested replies from each parent's text.
     comment_nodes = comments_div.select(
-        "ul.comment_list > li[id^='comment-'], "
-        "ol.comment_list > li[id^='comment-'], "
-        "ul.commentlist > li[id^='comment-'], "
-        "ol.commentlist > li[id^='comment-']"
+        "ul.comment_list li[id^='comment-'], "
+        "ol.comment_list li[id^='comment-'], "
+        "ul.commentlist li[id^='comment-'], "
+        "ol.commentlist li[id^='comment-']"
     )
 
     logger.info(f"Found {len(comment_nodes)} raw comment nodes on current page")

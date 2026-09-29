@@ -21,7 +21,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from .db_models import init_db, Ministry, Consultation, Article, Comment, Document, Base
 from .metadata_scraper import scrape_consultation_metadata
 from .content_scraper import scrape_consultation_content
-from .utils import get_request_headers
+from .utils import get_request_headers, OPENGOV_HOSTS, opengov_url_variants
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -29,12 +29,15 @@ logger = logging.getLogger(__name__)
 
 
 def normalize_consultation_url(url):
-    """Normalize URL for matching across http/https and trailing slash differences."""
+    """Normalize URL for matching across http/https, opengov host and trailing slash differences."""
     if not url:
         return None
     try:
         parsed = urlparse(url.strip())
         netloc = parsed.netloc.lower()
+        if netloc in OPENGOV_HOSTS:
+            # www.opengov.gr (older DB rows) and archive.opengov.gr are the same site
+            netloc = "opengov.gr"
         path = parsed.path or ""
         if path != "/" and path.endswith("/"):
             path = path.rstrip("/")
@@ -200,7 +203,7 @@ def scrape_and_store(url, session, selective_update=False, existing_cons=None):
     # Step 4: Create document records
     for doc_data in metadata_result['documents']:
         # Check if document already exists
-        existing_doc = session.query(Document).filter_by(url=doc_data['url']).first()
+        existing_doc = session.query(Document).filter(Document.url.in_(opengov_url_variants(doc_data['url']))).first()
         if not existing_doc:
             logger.info(f"Adding document: {doc_data['title']}")
             document = Document(
@@ -262,7 +265,7 @@ def scrape_and_store(url, session, selective_update=False, existing_cons=None):
     
     for article_data in articles_data:
         # Check if article already exists
-        existing_article = session.query(Article).filter_by(url=article_data['url']).first()
+        existing_article = session.query(Article).filter(Article.url.in_(opengov_url_variants(article_data['url']))).first()
         
         if existing_article:
             article = existing_article

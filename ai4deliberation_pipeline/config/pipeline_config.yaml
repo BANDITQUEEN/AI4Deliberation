@@ -34,8 +34,8 @@ scraper:
   max_retries: 3
   # User agent string
   user_agent: "AI4Deliberation-Bot/1.0"
-  # Base URL for OpenGov consultations
-  base_url: "https://www.opengov.gr/home/category/consultations"
+  # Base URL for OpenGov consultations (moved from www.opengov.gr to archive.opengov.gr)
+  base_url: "https://archive.opengov.gr/home/category/consultations"
   delay_between_requests: 1.0
 
 # HTML Processing Configuration

@@ -15,23 +15,27 @@ from bs4 import BeautifulSoup
 
 from .db_models import Consultation, init_db
 from .scrape_single_consultation import scrape_and_store
+from .utils import OPENGOV_HOSTS, resolve_announcement_url
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 # Constants
-BASE_URL = "https://www.opengov.gr/home/category/consultations"
+BASE_URL = "https://archive.opengov.gr/home/category/consultations"
 REQUEST_DELAY = (0.15, 0.25)  # Random delay between requests in seconds
 
 
 def normalize_consultation_url(url):
-    """Normalize URL for robust matching across http/https and trailing slash differences."""
+    """Normalize URL for robust matching across http/https, opengov host and trailing slash differences."""
     if not url:
         return None
     try:
         parsed = urlparse(url.strip())
         netloc = parsed.netloc.lower()
+        if netloc in OPENGOV_HOSTS:
+            # www.opengov.gr (older DB rows) and archive.opengov.gr are the same site
+            netloc = "opengov.gr"
         path = parsed.path or ""
         if path != "/" and path.endswith("/"):
             path = path.rstrip("/")
@@ -110,7 +114,7 @@ def get_consultation_links_from_page(url):
                     continue
 
                 raw_href = link_element["href"].strip()
-                consultation_url = urljoin(url, raw_href)
+                consultation_url = resolve_announcement_url(urljoin(url, raw_href))
                 consultation_title = link_element.get_text(strip=True)
 
                 date_span = item.find("span", class_="start")

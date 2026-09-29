@@ -1,12 +1,12 @@
 # AI4Deliberation Project
 
-This project encompasses a suite of tools and pipelines designed for processing, analyzing, and summarizing data related to public deliberations, primarily focusing on content from opengov.gr.
+This project encompasses a suite of tools and pipelines designed for processing, analyzing, and summarizing data related to public deliberations, primarily focusing on content from opengov.gr (now at [archive.opengov.gr](https://archive.opengov.gr)).
 
 ## Key Components
 
 ### 1. AI4Deliberation Pipeline (`ai4deliberation_pipeline/`)
 A comprehensive pipeline for:
-- Scraping consultation data (metadata, articles, comments, documents) from opengov.gr.
+- Scraping consultation data (metadata, articles, comments, documents) from opengov.gr (archive.opengov.gr).
 - Processing HTML content to Markdown.
 - Processing PDF and other document formats.
 - Cleaning textual content using specialized tools.

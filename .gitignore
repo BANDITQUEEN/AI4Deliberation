@@ -1,2 +1,4 @@
 *.db
-*.csv .venv/
+*.csv
+.venv/
+__pycache__/

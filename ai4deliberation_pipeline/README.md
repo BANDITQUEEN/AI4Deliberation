@@ -13,6 +13,13 @@ Key functionalities include:
 - Database integration using SQLAlchemy for persistent storage.
 - Modular orchestration of the entire workflow.
 
+### Data source
+opengov.gr has moved to **https://archive.opengov.gr** (the old `www.opengov.gr` address no longer serves the site). The scrapers read the consultation listing from `https://archive.opengov.gr/home/category/consultations`. As of September 2026 the newest listed consultation is from 10 July 2026.
+
+Some listing entries are homepage announcements (`archive.opengov.gr/home/YYYY/MM/DD/ID`) rather than consultation pages; the listers follow them to the ministry consultation they link to (`scraper/utils.py`: `resolve_announcement_url`).
+
+Databases scraped before the move store `www.opengov.gr` URLs. URL matching treats `www.opengov.gr`, `opengov.gr` and `archive.opengov.gr` as the same site (`scraper/utils.py`: `opengov_url_key`, `opengov_url_variants`), so updating an older database does not create duplicate consultations, articles or documents.
+
 ## 2. Core Components & Workflow
 The pipeline is primarily orchestrated by `master/pipeline_orchestrator.py`.
 

@@ -37,6 +37,7 @@ from utils.database import create_database_connection
 
 # Import unified modules
 from scraper.scrape_single_consultation import scrape_and_store
+from scraper.utils import opengov_url_key, opengov_url_variants
 from scraper.db_models import init_db, Consultation, Article, Document
 
 # Import the discovery function
@@ -152,9 +153,8 @@ class PipelineOrchestrator:
                 self.logger.info(f"Checking if consultation for {url} already exists (is_new={is_new}, selective_update={selective_update})...")
                 # Use a more robust check, possibly involving post_id if scrape_and_store can provide it early
                 # For now, URL based check is kept from original logic
-                normalized_url_like = f'%{url.split("?")[0]}%' 
                 existing_consultation = session.query(Consultation).filter(
-                    Consultation.url.like(normalized_url_like)
+                    Consultation.url.in_(opengov_url_variants(url))
                 ).first()
 
             if existing_consultation and not selective_update and not is_new:
@@ -529,8 +529,8 @@ class PipelineOrchestrator:
         db_session = Session()
         try:
             # Step 3: Get existing consultation URLs from DB for comparison
-            # Use full URLs for more precise checking
-            existing_consultation_urls = {res[0] for res in db_session.query(Consultation.url).all()}
+            # Compare host-independent keys so www.opengov.gr rows match archive.opengov.gr listings
+            existing_consultation_urls = {opengov_url_key(res[0]) for res in db_session.query(Consultation.url).all()}
             self.logger.info(f"Found {len(existing_consultation_urls)} unique consultation URLs in the database for exact matching.")
 
             # Step 4: Identify and process truly new consultations
@@ -540,7 +540,7 @@ class PipelineOrchestrator:
                 # No normalization here, compare the full URL
                 # normalized_url_from_csv = url_from_csv.split('?')[0] # Old logic
 
-                if url_from_csv not in existing_consultation_urls:
+                if opengov_url_key(url_from_csv) not in existing_consultation_urls:
                     self.logger.info(f"New consultation identified by full URL: {url_from_csv} (Title: {csv_entry.get('title', 'N/A')}). Processing...")
                     start_time_single = time.time()
                     try:

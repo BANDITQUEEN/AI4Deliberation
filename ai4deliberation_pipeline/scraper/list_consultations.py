@@ -13,12 +13,17 @@ from urllib.parse import urljoin
 import argparse
 from datetime import datetime
 
+try:
+    from .utils import resolve_announcement_url
+except ImportError:  # run as a script (pipeline_orchestrator does this)
+    from utils import resolve_announcement_url
+
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # Constants
-BASE_URL = "https://www.opengov.gr/home/category/consultations"
+BASE_URL = "https://archive.opengov.gr/home/category/consultations"
 OUTPUT_CSV = "all_consultations.csv"
 REQUEST_DELAY = (0.15, 0.25)  # Random delay between requests in seconds
 
@@ -90,11 +95,11 @@ def get_consultation_links_from_page(url, latest_known_date=None):
                     continue
                 
                 raw_href = link_element['href'].strip()
-                consultation_url = urljoin(url, raw_href)
+                consultation_url = resolve_announcement_url(urljoin(url, raw_href))
                 consultation_title = link_element.get_text(strip=True)
-                
+
                 # --- Validate URL structure (relaxed: allow redirects/trimmed links, still require opengov host) ---
-                url_pattern = r"https?://www\.opengov\.gr/.+"
+                url_pattern = r"https?://(www\.|archive\.)?opengov\.gr/.+"
                 if not re.match(url_pattern, consultation_url):
                     logger.warning(f"Skipping URL with unexpected host/structure: {consultation_url} (Title: {consultation_title})")
                     continue

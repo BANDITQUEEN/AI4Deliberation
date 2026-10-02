@@ -3,47 +3,68 @@
 
 import re
 import logging
+import threading
+import time
 import urllib.parse
 import unicodedata
 from datetime import datetime
+from random import uniform
+
 import requests
 from bs4 import BeautifulSoup
 
-# Set up logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+LOG_FORMAT = '%(asctime)s - %(levelname)s - %(message)s'
+
+REQUEST_TIMEOUT = 30
+REQUEST_DELAY = (0.15, 0.25)  # seconds between requests to the site
+
+_thread_local = threading.local()
+
+
+def http_get(url, allow_redirects=True, retries=3):
+    """GET with the shared headers, a per-thread session, a timeout, and retries on network/5xx errors."""
+    if not hasattr(_thread_local, 'session'):
+        _thread_local.session = requests.Session()
+        _thread_local.session.headers.update(get_request_headers())
+    for attempt in range(retries):
+        try:
+            response = _thread_local.session.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=allow_redirects)
+            response.raise_for_status()
+            return response
+        except requests.RequestException as e:
+            client_error = isinstance(e, requests.HTTPError) and e.response is not None and e.response.status_code < 500
+            if client_error or attempt == retries - 1:
+                raise
+            time.sleep(2 * (attempt + 1))
+
+
+def polite_sleep(delay_range=REQUEST_DELAY):
+    time.sleep(uniform(*delay_range))
+
+
+# Genitive month names appear on consultation and comment pages ("12 Μαρτίου 2025, 14:30"),
+# nominative ones in the consultation listing ("3 Δεκέμβριος, 2013").
+GREEK_MONTHS = {
+    'Ιανουαρίου': 1, 'Φεβρουαρίου': 2, 'Μαρτίου': 3, 'Απριλίου': 4, 'Μαΐου': 5, 'Ιουνίου': 6,
+    'Ιουλίου': 7, 'Αυγούστου': 8, 'Σεπτεμβρίου': 9, 'Οκτωβρίου': 10, 'Νοεμβρίου': 11, 'Δεκεμβρίου': 12,
+    'Ιανουάριος': 1, 'Φεβρουάριος': 2, 'Μάρτιος': 3, 'Απρίλιος': 4, 'Μάιος': 5, 'Ιούνιος': 6,
+    'Ιούλιος': 7, 'Αύγουστος': 8, 'Σεπτέμβριος': 9, 'Οκτώβριος': 10, 'Νοέμβριος': 11, 'Δεκέμβριος': 12,
+}
+_GREEK_DATE = re.compile(r'^(\d{1,2})\s+(\S+?),?\s+(\d{4})(?:,\s*(\d{1,2}):(\d{2}))?$')
+
+
 def parse_greek_date(date_string):
-    """Parses a Greek date string in format 'DD Month YYYY, HH:MM' to a datetime object"""
+    """Parse 'DD Month YYYY[, HH:MM]' or 'DD Month, YYYY' (Greek month names) to a datetime, or None."""
+    m = _GREEK_DATE.match(re.sub(r'\s+', ' ', date_string or '').strip())
+    month = GREEK_MONTHS.get(m.group(2)) if m else None
+    if not month:
+        logger.error(f"Error parsing date string '{date_string}'")
+        return None
     try:
-        # Replace Greek month names with English equivalents
-        greek_months = {
-            'Ιανουαρίου': 'January',
-            'Φεβρουαρίου': 'February',
-            'Μαρτίου': 'March',
-            'Απριλίου': 'April',
-            'Μαΐου': 'May',
-            'Ιουνίου': 'June',
-            'Ιουλίου': 'July',
-            'Αυγούστου': 'August',
-            'Σεπτεμβρίου': 'September',
-            'Οκτωβρίου': 'October',
-            'Νοεμβρίου': 'November',
-            'Δεκεμβρίου': 'December'
-        }
-        
-        for greek, english in greek_months.items():
-            date_string = date_string.replace(greek, english)
-        
-        # Remove extra spaces and standardize format
-        date_string = re.sub(r'\s+', ' ', date_string).strip()
-        
-        # Parse the date string with different possible formats
-        if ',' in date_string:
-            return datetime.strptime(date_string, '%d %B %Y, %H:%M')
-        else:
-            return datetime.strptime(date_string, '%d %B %Y')
-    except Exception as e:
+        return datetime(int(m.group(3)), month, int(m.group(1)), int(m.group(4) or 0), int(m.group(5) or 0))
+    except ValueError as e:
         logger.error(f"Error parsing date string '{date_string}': {e}")
         return None
 
@@ -93,26 +114,23 @@ def find_element_with_fallbacks(soup, selectors):
     return None
 
 def extract_post_id(url):
-    """Extract the post ID from a URL"""
-    try:
-        if not url:
-            return None
-        cleaned = url.strip()
-        if '?p=' in cleaned:
-            return cleaned.split('?p=')[1].split('&')[0]
-        return None
-    except Exception:
-        return None
+    """Extract the post ID from a URL ('...?p=123&cpage=2#comments' -> '123')."""
+    m = re.search(r'[?&]p=(\d+)', url or '')
+    return m.group(1) if m else None
 
 # opengov.gr moved to archive.opengov.gr; older DB rows keep the www host.
 OPENGOV_HOSTS = ('www.opengov.gr', 'opengov.gr', 'archive.opengov.gr')
 
+def strip_default_port(url):
+    """Drop an explicit default port: redirects sometimes yield 'https://archive.opengov.gr:443/...'."""
+    return re.sub(r'^(https://[^/:]+):443(?=/|$)|^(http://[^/:]+):80(?=/|$)', lambda m: m.group(1) or m.group(2), url or '') if url else url
+
 def opengov_url_key(url):
-    """Host- and scheme-independent key for an opengov URL (e.g. 'minenv/?p=13883')."""
+    """Host-, port- and scheme-independent key for an opengov URL (e.g. 'minenv/?p=13883')."""
     if not url:
         return url
     parsed = urllib.parse.urlparse(url.strip())
-    if parsed.netloc.lower() not in OPENGOV_HOSTS:
+    if (parsed.hostname or '') not in OPENGOV_HOSTS:
         return url.strip()
     key = parsed.path.lstrip('/')
     if parsed.query:
@@ -124,7 +142,42 @@ def opengov_url_variants(url):
     key = opengov_url_key(url)
     if key == (url or '').strip():
         return [url]
-    return [f"{scheme}://{host}/{key}" for scheme in ('https', 'http') for host in OPENGOV_HOSTS]
+    return ([f"{scheme}://{host}/{key}" for scheme in ('https', 'http') for host in OPENGOV_HOSTS]
+            + [f"https://{host}:443/{key}" for host in OPENGOV_HOSTS])
+
+def opengov_article_url_variants(url):
+    """Like opengov_url_variants, plus the '#comments' spelling that article links from consultation navigation carry."""
+    variants = opengov_url_variants(url)
+    return variants + [v + '#comments' for v in variants if '#' not in v]
+
+def normalize_consultation_url(url):
+    """Normalize URL for matching across http/https, opengov host and trailing slash differences."""
+    if not url:
+        return None
+    try:
+        parsed = urllib.parse.urlparse(url.strip())
+        netloc = parsed.netloc.lower()
+        if (parsed.hostname or '') in OPENGOV_HOSTS:
+            # www.opengov.gr (older DB rows) and archive.opengov.gr are the same site
+            netloc = "opengov.gr"
+        path = parsed.path or ""
+        if path != "/" and path.endswith("/"):
+            path = path.rstrip("/")
+        query = parsed.query or ""
+        if query:
+            return f"{netloc}{path}?{query}"
+        return f"{netloc}{path}"
+    except Exception:
+        return None
+
+def extract_ministry_code_from_url(url):
+    """Extract ministry code from URL path, e.g. '/yme/?p=5739' -> 'yme'."""
+    try:
+        parsed = urllib.parse.urlparse((url or "").strip())
+        path_parts = [part for part in parsed.path.strip("/").split("/") if part]
+        return path_parts[0].lower() if path_parts else None
+    except Exception:
+        return None
 
 # Homepage announcement posts, e.g. archive.opengov.gr/home/2026/07/10/10155
 ANNOUNCEMENT_PATH = re.compile(r'^/home/\d{4}/\d{2}/\d{2}/\d+/?$')
@@ -133,11 +186,10 @@ def resolve_announcement_url(url):
     """The consultation listing sometimes links to a homepage announcement instead of the
     consultation itself; return the ministry consultation URL it points to, or `url` unchanged."""
     parsed = urllib.parse.urlparse(url)
-    if parsed.netloc.lower() not in OPENGOV_HOSTS or not ANNOUNCEMENT_PATH.match(parsed.path):
+    if (parsed.hostname or '') not in OPENGOV_HOSTS or not ANNOUNCEMENT_PATH.match(parsed.path):
         return url
     try:
-        response = requests.get(url, headers=get_request_headers(), timeout=30)
-        response.raise_for_status()
+        response = http_get(url)
         post = BeautifulSoup(response.content, 'html.parser').select_one('div.single_post')
         for a in (post.find_all('a', href=True) if post else []):
             target = urllib.parse.urljoin(url, a['href'].strip())
@@ -160,7 +212,7 @@ def extract_ministry_info(url):
     try:
         # Parse URL to get ministry code
         parsed_url = urllib.parse.urlparse(url)
-        hostname = parsed_url.netloc
+        hostname = parsed_url.hostname or ''  # without port: redirects can add ':443'
         path_parts = parsed_url.path.strip('/').split('/')
         
         # Try to extract ministry code from URL

@@ -1,195 +1,54 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+Build and maintain the consultations database.
+
+Steps, run in this order and combinable:
+  listing (default)         scrape every consultation in the central listing;
+  --repair                  re-fetch comments wherever the site shows more than the DB holds
+                            (articles and consultation root posts);
+  --discover-by-id MODE     scan post IDs for consultations the listing misses (see list_consultations.py):
+                            'known' scans KNOWN_RANGES (~25k requests), 'stats-gaps' only the ID ranges around
+                            consultations the site's statistics page lists but the DB lacks.
+When --repair or --discover-by-id is given, the listing step runs only with --listing.
+"""
 
 import argparse
 import logging
-import os
-import time
-from collections import defaultdict
+import re
 from datetime import datetime
-from random import uniform
-from urllib.parse import urljoin, urlparse
 
-import requests
-from bs4 import BeautifulSoup
+from sqlalchemy import func
 
-from .db_models import Consultation, init_db
-from .scrape_single_consultation import scrape_and_store
-from .utils import OPENGOV_HOSTS, resolve_announcement_url
+from .content_scraper import (CONSULTATION_ROOT, extract_comments, fetch_page_soup, parse_article_nav,
+                              scrape_article_content)
+from .db_models import DEFAULT_DB_URL, Article, Comment, Consultation, init_db
+from .db_population_report import match_site_rows, url_key
+from .list_consultations import (KNOWN_RANGES, dedupe_consultation_links, duplicate_of_group,
+                                 find_unlisted_consultations, get_all_consultations, ranges_for_stats_gaps,
+                                 scan_post_ids)
+from .scrape_single_consultation import attach_articles, find_existing_consultation, scrape_and_store, store_articles
+from .utils import LOG_FORMAT, extract_post_id, opengov_article_url_variants, opengov_url_key, polite_sleep
 
-# Set up logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# Constants
-BASE_URL = "https://archive.opengov.gr/home/category/consultations"
-REQUEST_DELAY = (0.15, 0.25)  # Random delay between requests in seconds
 
-
-def normalize_consultation_url(url):
-    """Normalize URL for robust matching across http/https, opengov host and trailing slash differences."""
-    if not url:
-        return None
-    try:
-        parsed = urlparse(url.strip())
-        netloc = parsed.netloc.lower()
-        if netloc in OPENGOV_HOSTS:
-            # www.opengov.gr (older DB rows) and archive.opengov.gr are the same site
-            netloc = "opengov.gr"
-        path = parsed.path or ""
-        if path != "/" and path.endswith("/"):
-            path = path.rstrip("/")
-        query = parsed.query or ""
-        if query:
-            return f"{netloc}{path}?{query}"
-        return f"{netloc}{path}"
-    except Exception:
-        return None
-
-
-def extract_ministry_code_from_url(url):
-    """Extract ministry code from URL path, e.g. '/yme/?p=5739' -> 'yme'."""
-    try:
-        parsed = urlparse((url or "").strip())
-        path_parts = [part for part in parsed.path.strip("/").split("/") if part]
-        return path_parts[0].lower() if path_parts else None
-    except Exception:
-        return None
-
-
-def dedupe_consultation_links(consultation_links):
-    """Deduplicate consultation links by normalized URL, preserving order."""
-    seen = set()
-    deduped = []
-
-    for c in consultation_links:
-        norm = normalize_consultation_url(c.get("url"))
-        if not norm:
-            continue
-        if norm in seen:
-            continue
-        seen.add(norm)
-        deduped.append(c)
-
-    logger.info(f"Deduplicated consultations: {len(consultation_links)} -> {len(deduped)}")
-    return deduped
-
-
-def get_consultation_links_from_page(url):
-    """Extract all consultation links and titles from a page."""
-    logger.info(f"Fetching consultation links from: {url}")
-
-    try:
-        response = requests.get(url, timeout=30, allow_redirects=True)
-        response.raise_for_status()
-
-        soup = BeautifulSoup(response.content, "html.parser")
-
-        content_div = soup.find("div", class_="downspace_item_content archive_list")
-        if not content_div:
-            logger.error(f"Could not find consultation listings div on page: {url}")
-            return [], None
-
-        consultations = []
-        list_items = content_div.find_all("li")
-
-        for item in list_items:
-            try:
-                link_element = None
-                for candidate in [
-                    item.find("a"),
-                    item.find("p").find("a") if item.find("p") else None,
-                    item.find("h2").find("a") if item.find("h2") else None,
-                    item.find("h3").find("a") if item.find("h3") else None,
-                ]:
-                    if candidate and candidate.has_attr("href") and candidate.get_text(strip=True):
-                        link_element = candidate
-                        break
-
-                if not link_element:
-                    logger.warning(
-                        "Could not find a suitable link/title element in list item: "
-                        f"{item.get_text(strip=True)[:100]}..."
-                    )
-                    continue
-
-                raw_href = link_element["href"].strip()
-                consultation_url = resolve_announcement_url(urljoin(url, raw_href))
-                consultation_title = link_element.get_text(strip=True)
-
-                date_span = item.find("span", class_="start")
-                consultation_date = date_span.get_text(strip=True) if date_span else ""
-
-                consultations.append(
-                    {
-                        "url": consultation_url,
-                        "title": consultation_title,
-                        "date": consultation_date,
-                    }
-                )
-
-            except Exception as e:
-                logger.error(f"Error extracting consultation details: {e}")
-
-        pagination = soup.find("div", class_="wp-pagenavi")
-        next_page_url = None
-
-        if pagination:
-            next_link = pagination.find("a", class_="nextpostslink")
-            if next_link and next_link.has_attr("href"):
-                next_page_url = next_link["href"]
-                logger.info(f"Found next page link: {next_page_url}")
-
-        return consultations, next_page_url
-
-    except Exception as e:
-        logger.error(f"Error fetching page {url}: {e}")
-        return [], None
-
-
-def get_all_consultation_links(start_page=1, end_page=None):
-    """Get all consultation links from all pages within the specified range."""
-    all_consultations = []
-    current_url = BASE_URL
-    page_number = 1
-
-    while page_number < start_page and current_url:
-        logger.info(f"Skipping to page {start_page}, currently at page {page_number}")
-        _, next_page_url = get_consultation_links_from_page(current_url)
-        if next_page_url:
-            current_url = next_page_url
-            page_number += 1
-        else:
-            logger.error(f"Could not navigate to page {start_page}")
-            return []
-
-    while current_url:
-        if end_page and page_number > end_page:
-            logger.info(f"Reached end page {end_page}. Stopping.")
-            break
-
-        logger.info(f"Processing page {page_number}")
-        consultations, next_page_url = get_consultation_links_from_page(current_url)
-
-        if consultations:
-            logger.info(f"Found {len(consultations)} consultations on page {page_number}")
-            all_consultations.extend(consultations)
-        else:
-            logger.warning(f"No consultations found on page {page_number}")
-
-        if next_page_url:
-            current_url = next_page_url
-            page_number += 1
-
-            delay = uniform(*REQUEST_DELAY)
-            logger.info(f"Waiting {delay:.2f} seconds before next request...")
-            time.sleep(delay)
-        else:
-            logger.info("No more pages found. Scraping complete.")
-            current_url = None
-
-    logger.info(f"Total consultation links found before dedupe: {len(all_consultations)}")
-    return all_consultations
+def format_changes(changes):
+    """Human-readable list of what a selective update changed."""
+    stats = []
+    if changes["new_comments"] > 0:
+        stats.append(f"+{changes['new_comments']} comments")
+    if changes["new_documents"] > 0:
+        stats.append(f"+{changes['new_documents']} documents")
+    if changes["total_comments_change"] != 0:
+        stats.append(f"{changes['total_comments_change']:+d} total comments")
+    if changes["start_message_changed"]:
+        stats.append("start minister message updated")
+    if changes["end_message_changed"]:
+        stats.append("end minister message updated")
+    if changes["status_change"]:
+        stats.append("status: unfinished → finished")
+    return stats
 
 
 def save_update_report(update_reports, output_file="unfinished_consultation_updates.txt"):
@@ -198,33 +57,14 @@ def save_update_report(update_reports, output_file="unfinished_consultation_upda
         with open(output_file, "w", encoding="utf-8") as f:
             f.write("# Update Report for Unfinished Consultations\n\n")
             f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-
             for url, title, changes in update_reports:
-                f.write(f"## {title}\n")
-                f.write(f"URL: {url}\n\n")
-
-                update_stats = []
-                if changes["new_comments"] > 0:
-                    update_stats.append(f"+{changes['new_comments']} comments")
-                if changes["new_documents"] > 0:
-                    update_stats.append(f"+{changes['new_documents']} documents")
-                if changes["total_comments_change"] != 0:
-                    update_stats.append(f"{changes['total_comments_change']:+d} total comments")
-                if changes["start_message_changed"]:
-                    update_stats.append("start minister message updated")
-                if changes["end_message_changed"]:
-                    update_stats.append("end minister message updated")
-                if changes["status_change"]:
-                    update_stats.append("status: unfinished → finished")
-
-                if update_stats:
-                    f.write("Changes:\n")
-                    for stat in update_stats:
-                        f.write(f"- {stat}\n")
+                f.write(f"## {title}\nURL: {url}\n\n")
+                stats = format_changes(changes)
+                if stats:
+                    f.write("Changes:\n" + "".join(f"- {s}\n" for s in stats))
                 else:
                     f.write("No changes detected\n")
                 f.write("\n")
-
         logger.info(f"Update report saved to {output_file}")
         return True
     except Exception as e:
@@ -232,95 +72,16 @@ def save_update_report(update_reports, output_file="unfinished_consultation_upda
         return False
 
 
-def build_existing_indexes(session):
-    """Load existing consultations once into lookup indexes."""
-    existing_by_url = {}
-    existing_by_post_id = defaultdict(list)
-
-    all_existing = session.query(Consultation).all()
-    logger.info(f"Loaded {len(all_existing)} existing consultations from database for matching")
-
-    for cons in all_existing:
-        norm_url = normalize_consultation_url(cons.url)
-        if norm_url:
-            existing_by_url[norm_url] = cons
-
-        if cons.post_id:
-            existing_by_post_id[cons.post_id].append(cons)
-
-    return existing_by_url, existing_by_post_id
-
-
-def find_existing_consultation(url, post_id, existing_by_url, existing_by_post_id):
-    """
-    Find an existing consultation using:
-    1. normalized URL
-    2. post_id + ministry code
-
-    Never trust post_id alone, because the same ?p= id can exist under different ministries.
-    """
-    normalized_url = normalize_consultation_url(url)
-    if normalized_url and normalized_url in existing_by_url:
-        return existing_by_url[normalized_url]
-
-    if not post_id:
-        return None
-
-    post_id_matches = existing_by_post_id.get(post_id, [])
-    target_ministry = extract_ministry_code_from_url(url)
-
-    ministry_matches = [
-        cons for cons in post_id_matches
-        if extract_ministry_code_from_url(cons.url) == target_ministry
-    ]
-
-    if len(ministry_matches) == 1:
-        return ministry_matches[0]
-
-    if len(ministry_matches) > 1:
-        unfinished = [cons for cons in ministry_matches if not cons.is_finished]
-        chosen = unfinished[0] if unfinished else ministry_matches[0]
-        logger.warning(
-            f"Found {len(ministry_matches)} ministry-matching consultations "
-            f"for post_id={post_id}; selected URL={chosen.url}"
-        )
-        return chosen
-
-    if post_id_matches:
-        logger.warning(
-            f"Found post_id={post_id} in DB, but only under different ministry/ministries. "
-            f"Treating as new consultation: {url}"
-        )
-
-    return None
-
-
-def scrape_consultations_to_db(
-    consultation_links,
-    db_url,
-    batch_size=20,
-    max_count=None,
-    force_scrape=False,
-    fresh_db=False,
-):
-    """Scrape consultations and store in database."""
+def scrape_consultations_to_db(consultation_links, db_url, batch_size=20, max_count=None, force_scrape=False, fresh_db=False):
+    """Scrape consultations and store them; finished ones already stored are skipped, unfinished ones updated."""
     engine, Session = init_db(db_url)
     session = Session()
 
     total_count = len(consultation_links)
-    processed_count = 0
-    success_count = 0
-    skipped_count = 0
+    processed_count = success_count = skipped_count = 0
     update_reports = []
-
     logger.info(f"Starting to scrape {total_count} consultations to database")
-
-    existing_by_url = {}
-    existing_by_post_id = defaultdict(list)
-
-    if not force_scrape and not fresh_db:
-        existing_by_url, existing_by_post_id = build_existing_indexes(session)
-    elif fresh_db:
+    if fresh_db:
         logger.info("Fresh DB mode enabled: skipping existing-record checks")
 
     try:
@@ -330,70 +91,39 @@ def scrape_consultations_to_db(
                 break
 
             url = consultation["url"]
-            post_id = url.split("?p=")[-1] if "?p=" in url else None
+            existing = None if (force_scrape or fresh_db) else find_existing_consultation(session, url)
 
-            existing = None
-            if not force_scrape and not fresh_db:
-                existing = find_existing_consultation(
-                    url=url,
-                    post_id=post_id,
-                    existing_by_url=existing_by_url,
-                    existing_by_post_id=existing_by_post_id,
-                )
-
-            if existing and not force_scrape:
-                if existing.is_finished:
-                    logger.info(f"Skipping finished consultation: {url}")
-                    skipped_count += 1
-                else:
-                    logger.info(f"Updating unfinished consultation {processed_count + 1}/{total_count}: {url}")
-                    try:
-                        result, changes = scrape_and_store(
-                            url,
-                            session,
-                            selective_update=True,
-                            existing_cons=existing,
-                        )
-                        if result:
-                            success_count += 1
-
-                            update_stats = []
-                            if changes["new_comments"] > 0:
-                                update_stats.append(f"+{changes['new_comments']} comments")
-                            if changes["new_documents"] > 0:
-                                update_stats.append(f"+{changes['new_documents']} documents")
-                            if changes["total_comments_change"] != 0:
-                                update_stats.append(f"{changes['total_comments_change']:+d} total comments")
-                            if changes["start_message_changed"]:
-                                update_stats.append("start minister message updated")
-                            if changes["end_message_changed"]:
-                                update_stats.append("end minister message updated")
-                            if changes["status_change"]:
-                                update_stats.append("status: unfinished → finished")
-
-                            if update_stats:
-                                stats_str = ", ".join(update_stats)
-                                logger.info(f"Update summary for {existing.title}: {stats_str}")
-                                update_reports.append((url, existing.title, changes))
-                        else:
-                            logger.warning(f"Failed to update unfinished consultation: {url}")
-                    except Exception as e:
-                        logger.error(f"Error updating unfinished consultation {url}: {e}")
-                        session.rollback()
+            if existing and existing.is_finished:
+                logger.info(f"Skipping finished consultation: {url}")
+                skipped_count += 1
+            elif existing:
+                logger.info(f"Updating unfinished consultation {processed_count + 1}/{total_count}: {url}")
+                try:
+                    ok, changes = scrape_and_store(url, session, selective_update=True, existing_cons=existing)
+                    if ok:
+                        success_count += 1
+                        stats = format_changes(changes)
+                        if stats:
+                            logger.info(f"Update summary for {existing.title}: {', '.join(stats)}")
+                            update_reports.append((url, existing.title, changes))
+                    else:
+                        logger.warning(f"Failed to update unfinished consultation: {url}")
+                except Exception as e:
+                    logger.error(f"Error updating unfinished consultation {url}: {e}")
+                    session.rollback()
             else:
                 logger.info(f"Processing consultation {processed_count + 1}/{total_count}: {url}")
                 try:
-                    result = scrape_and_store(url, session)
-                    if result:
+                    ok, _ = scrape_and_store(url, session)
+                    if ok:
                         success_count += 1
                     else:
-                        logger.warning(f"Skipping consultation that returned False: {url}")
+                        logger.warning(f"Consultation not stored: {url}")
                 except Exception as e:
                     logger.error(f"Error processing consultation {url}: {e}")
                     session.rollback()
 
             processed_count += 1
-
             if processed_count % batch_size == 0:
                 try:
                     logger.info(f"Committing batch of {batch_size} consultations")
@@ -403,18 +133,9 @@ def scrape_consultations_to_db(
                     session.rollback()
 
             if i < len(consultation_links) - 1:
-                delay = uniform(*REQUEST_DELAY)
-                logger.info(f"Waiting {delay:.2f} seconds before next consultation...")
-                time.sleep(delay)
+                polite_sleep()
 
-        if processed_count % batch_size != 0:
-            try:
-                logger.info(f"Committing final batch of {processed_count % batch_size} consultations")
-                session.commit()
-            except Exception as e:
-                logger.error(f"Error in final batch processing: {e}")
-                session.rollback()
-
+        session.commit()
     except Exception as e:
         logger.error(f"Error in batch processing: {e}")
         session.rollback()
@@ -422,91 +143,188 @@ def scrape_consultations_to_db(
         session.close()
 
     logger.info("=== Scraping Results ===")
-    logger.info(f"Batch processing complete. Processed {processed_count} consultations.")
-    logger.info(f"Success: {success_count}, Skipped: {skipped_count}")
-
+    logger.info(f"Processed {processed_count} consultations. Stored/updated: {success_count}, "
+                f"skipped (finished): {skipped_count}, failed: {processed_count - success_count - skipped_count}")
     if update_reports:
         save_update_report(update_reports)
-
-    logger.info(f"Failed: {processed_count - success_count - skipped_count}")
-    logger.info("=======================")
-
     return success_count
+
+
+# --- repair ----------------------------------------------------------------------------------
+
+def repair_consultation(session, consultation, dry_run=False):
+    """Compare one consultation with the comment counts its page shows; re-fetch whatever the DB is short of."""
+    soup, final_url = fetch_page_soup(consultation.url)
+    if extract_post_id(final_url) != consultation.post_id:
+        return [{'consultation': consultation.url, 'error': f'page redirects to {final_url}'}]
+    stored = {}
+    for article, n in session.query(Article, func.count(Comment.id)).outerjoin(Comment).filter(
+            Article.consultation_id == consultation.id).group_by(Article.id):
+        stored[url_key(article.url)] = n
+
+    todo = []
+    nav = parse_article_nav(soup, final_url)
+    for entry in nav:
+        key = url_key(entry['url'])
+        if key in stored:
+            if entry['site_comments'] is not None and entry['site_comments'] > stored[key]:
+                todo.append({'url': entry['url'], 'reason': 'article short', 'site': entry['site_comments'], 'stored': stored[key]})
+        elif not session.query(Article.id).filter(Article.url.in_(opengov_article_url_variants(entry['url']))).first():
+            todo.append({'url': entry['url'], 'reason': 'article missing', 'site': entry['site_comments'], 'stored': 0})
+
+    # Comments on the root post: the site shows no count for it, so count what its comment pages hold.
+    root_key = url_key(consultation.url)
+    if root_key not in {url_key(e['url']) for e in nav} and soup.select("li[id^='comment-']"):
+        on_site = len(extract_comments(soup, final_url))
+        if on_site > stored.get(root_key, 0):
+            todo.append({'url': consultation.url, 'reason': 'root comments', 'site': on_site,
+                         'stored': stored.get(root_key, 0), 'root': True})
+
+    for item in todo:
+        item['consultation'] = consultation.url
+        if dry_run:
+            continue
+        polite_sleep()
+        data = scrape_article_content(item['url'])
+        if not data:
+            item['error'] = 'scrape failed'
+            continue
+        if item.get('root') and not session.query(Article.id).filter(
+                Article.url.in_(opengov_article_url_variants(consultation.url))).first():
+            data['extraction_method'] = CONSULTATION_ROOT
+        item['added_articles'], item['added_comments'] = store_articles(session, consultation, [data])
+        session.commit()
+    return todo
+
+
+def repair_consultations(session, dry_run=False):
+    """--repair: compare every consultation with its page's comment counts."""
+    report = {'consultations': []}
+    consultations = session.query(Consultation).order_by(Consultation.id).all()
+    for i, consultation in enumerate(consultations, 1):
+        try:
+            found = repair_consultation(session, consultation, dry_run)
+        except Exception as e:
+            session.rollback()
+            found = [{'consultation': consultation.url, 'error': str(e)}]
+        report['consultations'].extend(found)
+        for item in found:
+            logger.info(f"[{i}/{len(consultations)}] {item}")
+        if i % 100 == 0:
+            logger.info(f"Repair progress: {i}/{len(consultations)}")
+        polite_sleep()
+    added = sum(item.get('added_comments', 0) for item in report['consultations'])
+    unfixed = sum(1 for item in report['consultations'] if not dry_run and 'error' not in item
+                  and not item.get('added_comments') and not item.get('added_articles'))
+    logger.info(f"Repair: {len(report['consultations'])} findings, "
+                f"{added} comments added{' (dry run)' if dry_run else f', {unfixed} findings with nothing to add'}")
+    return report
+
+
+# --- discovery by post ID --------------------------------------------------------------------
+
+# A consultation whose root post is gone is stored from one of its articles; give it the stats-page title then.
+ARTICLE_TITLE = re.compile(r'^\s*(Άρθρο|ΑΡΘΡΟ|ΚΕΦΑΛΑΙΟ|Κεφάλαιο|ΜΕΡΟΣ|Μέρος)\b')
+
+
+def discover_unlisted(session, mode, scan_file, workers=4, dry_run=False, skip=()):
+    """--discover-by-id: scan post IDs, then scrape (or attach) the consultations the DB lacks."""
+    if mode == 'stats-gaps':
+        ranges, stats_gaps = ranges_for_stats_gaps(session)
+    else:
+        ranges = KNOWN_RANGES
+        pairs, site_only, _ = match_site_rows(session)
+        stats_gaps = (site_only, pairs)
+    scan_post_ids(ranges, scan_file, workers)
+    groups = find_unlisted_consultations(scan_file, session, stats_gaps)
+    logger.info(f"Found {len(groups)} consultations missing from the DB")
+
+    skip_keys = {url_key(u) for u in skip}
+    report = []
+    for g in groups:
+        skipped = bool(skip_keys & {url_key(f"{g['url'].split('?')[0]}?p={p}") for p in g['members']})
+        duplicate, comments = (None, 0) if skipped else duplicate_of_group(session, g)
+        g['duplicate_of'] = opengov_url_key(duplicate.url) if duplicate is not None else None
+        note = ''
+        if duplicate is not None and comments:
+            # a second posting with comments of its own: store it, so no comments are lost
+            note = f" (same articles as {g['duplicate_of']}, but {comments} comments of its own: review)"
+            logger.warning(f"{g['url']}{note}")
+        if skipped:
+            g['action'] = 'skipped (--skip)'
+        elif duplicate is not None and not comments:
+            g['action'] = f"{'would skip' if dry_run else 'skipped'}: same articles as {g['duplicate_of']}, no comments"
+        elif dry_run:
+            g['action'] = f"would attach to {g['attach_to']}" if g['attach_to'] else 'would scrape'
+        elif g['attach_to']:
+            target = session.query(Consultation).filter_by(url=g['attach_to']).one()
+            g['articles'], g['comments'] = attach_articles(session, target, g['url'])
+            g['action'] = f"attached to {g['attach_to']}"
+        else:
+            ok, cid = scrape_and_store(g['url'], session)
+            g['action'] = 'scraped' if ok else 'failed'
+            g['consultation_id'] = cid
+            consultation = session.get(Consultation, cid) if ok else None
+            if consultation is not None and g.get('root_is_article'):
+                # the root is one of the articles, and its own navigation omits it
+                data = scrape_article_content(g['url'])
+                if data:
+                    store_articles(session, consultation, [data])
+            if consultation is not None and g.get('stats_title') and ARTICLE_TITLE.match(consultation.title or ''):
+                consultation.title = g['stats_title']
+            session.commit()
+            polite_sleep()
+        g['action'] += note
+        logger.info(f"{g['url']} articles={g['n_articles']} comments_seen={g['comments_seen']} "
+                    f"stats_row={g['stats_row']}: {g['action']}")
+        report.append(g)
+    return {'ranges': {s: list(v) if isinstance(v, list) else [v] for s, v in ranges.items()}, 'consultations': report}
 
 
 def main():
     """Main function to scrape all consultations and store in DB."""
-    parser = argparse.ArgumentParser(
-        description="Scrape all consultations from OpenGov.gr and store in database"
-    )
-
-    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    default_db_path = f"sqlite:///{os.path.join(project_root, 'deliberation_data_gr.db')}"
-
-    parser.add_argument(
-        "--db-path",
-        type=str,
-        default=default_db_path,
-        help=f"Database URL (default: {default_db_path})",
-    )
-    parser.add_argument(
-        "--start-page",
-        type=int,
-        default=1,
-        help="Starting page number (default: 1)",
-    )
-    parser.add_argument(
-        "--end-page",
-        type=int,
-        default=None,
-        help="Ending page number (default: scrape all pages)",
-    )
-    parser.add_argument(
-        "--max-count",
-        type=int,
-        default=None,
-        help="Maximum number of consultations to scrape (default: all)",
-    )
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=10,
-        help="Commit to database after processing this many consultations (default: 10)",
-    )
-    parser.add_argument(
-        "--force-scrape",
-        action="store_true",
-        help="Force scrape even if consultation already exists in database",
-    )
-    parser.add_argument(
-        "--fresh-db",
-        action="store_true",
-        help="Skip existing-record checks; use only for a brand-new empty database",
-    )
-
+    parser = argparse.ArgumentParser(description="Build and maintain the OpenGov.gr consultations database",
+                                     formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
+    parser.add_argument("--db-path", type=str, default=DEFAULT_DB_URL, help=f"Database URL (default: {DEFAULT_DB_URL})")
+    listing = parser.add_argument_group("listing step")
+    listing.add_argument("--listing", action="store_true", help="Run the listing step together with --repair/--discover-by-id")
+    listing.add_argument("--start-page", type=int, default=1, help="Starting page number (default: 1)")
+    listing.add_argument("--end-page", type=int, default=None, help="Ending page number (default: scrape all pages)")
+    listing.add_argument("--max-count", type=int, default=None, help="Maximum number of consultations to scrape (default: all)")
+    listing.add_argument("--batch-size", type=int, default=10, help="Commit after this many consultations (default: 10)")
+    listing.add_argument("--force-scrape", action="store_true", help="Force scrape even if consultation already exists in database")
+    listing.add_argument("--fresh-db", action="store_true", help="Skip existing-record checks; use only for a brand-new empty database")
+    steps = parser.add_argument_group("repair and discovery steps")
+    steps.add_argument("--repair", action="store_true", help="Re-fetch comments the DB is short of")
+    steps.add_argument("--discover-by-id", choices=["known", "stats-gaps"], help="Scan post IDs for consultations the listing misses")
+    steps.add_argument("--id-scan-file", default="id_scan.jsonl", help="Scan results (JSONL); an existing file is resumed (default: id_scan.jsonl)")
+    steps.add_argument("--workers", type=int, default=4, help="Parallel requests while scanning post IDs (default: 4)")
+    steps.add_argument("--skip", nargs="+", metavar="URL", help="With --discover-by-id: do not store the candidates containing these posts (e.g. after a --dry-run)")
+    steps.add_argument("--dry-run", action="store_true", help="Report what --repair/--discover-by-id would change, without changing the DB")
     args = parser.parse_args()
-
-    logger.info("Starting mass consultation scraper")
+    logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
     logger.info(f"Using database: {args.db_path}")
-    logger.info(f"Fresh DB mode: {args.fresh_db}")
 
-    consultation_links = get_all_consultation_links(args.start_page, args.end_page)
-    consultation_links = dedupe_consultation_links(consultation_links)
+    if args.listing or not (args.repair or args.discover_by_id):
+        links = dedupe_consultation_links(get_all_consultations(args.start_page, args.end_page))
+        if not links:
+            logger.error("No consultation links found to process")
+        else:
+            stored = scrape_consultations_to_db(links, args.db_path, batch_size=args.batch_size, max_count=args.max_count,
+                                                force_scrape=args.force_scrape, fresh_db=args.fresh_db)
+            logger.info(f"Listing step complete: {stored} consultations stored or updated")
 
-    if not consultation_links:
-        logger.error("No consultation links found to process")
-        return
-
-    success_count = scrape_consultations_to_db(
-        consultation_links,
-        args.db_path,
-        batch_size=args.batch_size,
-        max_count=args.max_count,
-        force_scrape=args.force_scrape,
-        fresh_db=args.fresh_db,
-    )
-
-    logger.info(f"Consultation scraping complete! Successfully stored {success_count} consultations.")
+    if args.repair or args.discover_by_id:
+        _, Session = init_db(args.db_path)
+        session = Session()
+        try:
+            if args.repair:
+                repair_consultations(session, args.dry_run)
+            if args.discover_by_id:
+                discover_unlisted(session, args.discover_by_id, args.id_scan_file, args.workers, args.dry_run,
+                                  args.skip or ())
+        finally:
+            session.close()
 
 
 if __name__ == "__main__":

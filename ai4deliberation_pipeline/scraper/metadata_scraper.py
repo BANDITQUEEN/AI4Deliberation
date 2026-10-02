@@ -3,9 +3,7 @@
 
 import re
 import logging
-import requests
-import time
-from urllib.parse import urljoin
+from datetime import datetime
 from bs4 import BeautifulSoup
 
 # Use local utils module
@@ -16,13 +14,12 @@ from .utils import (
     extract_post_id,
     build_absolute_url,
     extract_ministry_info,
-    get_request_headers,
+    http_get,
+    strip_default_port,
     normalize_text,
     categorize_document
 )
 
-# Set up logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 def scrape_consultation_metadata(url):
@@ -34,11 +31,10 @@ def scrape_consultation_metadata(url):
         
         # Fetch the HTML content
         logger.info(f"Fetching URL: {url}")
-        response = requests.get(url, headers=get_request_headers(), timeout=30, allow_redirects=True)
-        response.raise_for_status()
+        response = http_get(url, allow_redirects=True)
         
         # Get the final URL after any redirections
-        final_url = response.url
+        final_url = strip_default_port(response.url)
         if final_url != url:
             logger.info(f"URL was redirected: {url} -> {final_url}")
             url = final_url
@@ -97,7 +93,6 @@ def scrape_consultation_metadata(url):
                     logger.info("Deliberation marked as finished by 'Ολοκληρώθηκε' text")
                 elif metadata['end_date']:
                     # If no specific indicator, check against current date
-                    from datetime import datetime
                     metadata['is_finished'] = datetime.now() > metadata['end_date']
                     logger.info(f"Deliberation status determined by date: {'Finished' if metadata['is_finished'] else 'Ongoing'}")
             else:
@@ -227,7 +222,8 @@ def scrape_consultation_metadata(url):
                 
                 # If no title found, construct it from post_id
                 if not metadata['title'] and metadata['post_id']:
-                    metadata['title'] = f"Δημόσια Διαβούλευση Υπουργείου Δικαιοσύνης {metadata['post_id']}"
+                    ministry_label = ministry_info.get('name') or ministry_info.get('code') or ''
+                    metadata['title'] = f"Δημόσια Διαβούλευση {ministry_label} {metadata['post_id']}".replace('  ', ' ')
                     logger.info(f"Created default title from post_id: {metadata['title']}")
                 
                 # Get end minister message (for finished deliberations)
@@ -286,6 +282,7 @@ def scrape_consultation_metadata(url):
         return None
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     # Example usage
     test_url = "http://www.opengov.gr/koinsynoik/?p=9557"
     result = scrape_consultation_metadata(test_url)

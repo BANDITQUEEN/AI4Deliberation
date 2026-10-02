@@ -246,14 +246,12 @@ class EuDirective(Base):
     def __repr__(self):
         return f"<EuDirective(title='{self.title[:50]}...', directive_number='{self.directive_number}')>"
 
+# Default database for the scraper CLIs: ai4deliberation_pipeline/deliberation_data_gr.db
+DEFAULT_DB_URL = f"sqlite:///{os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'deliberation_data_gr.db')}"
+
 def init_db(db_url=None):
     """Initialize the database, creating all tables"""
-    if db_url is None:
-        # Use the project root directory for the database
-        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        db_path = os.path.join(project_root, 'deliberation_data_gr.db')
-        db_url = f'sqlite:///{db_path}'
-    engine = create_engine(db_url)
+    engine = create_engine(db_url or DEFAULT_DB_URL)
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine)
     return engine, Session

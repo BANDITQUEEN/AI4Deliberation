@@ -3,60 +3,109 @@
 
 import argparse
 import logging
-import os
-import sys
-from datetime import datetime
+
 from sqlalchemy import func
-import requests
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy import create_engine
-from random import uniform
-from urllib.parse import urlparse
 
-
-# Add current directory to path for imports when called from other locations
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-
-# Import our modules
-from .db_models import init_db, Ministry, Consultation, Article, Comment, Document, Base
+from .db_models import DEFAULT_DB_URL, init_db, Ministry, Consultation, Article, Comment, Document
 from .metadata_scraper import scrape_consultation_metadata
 from .content_scraper import scrape_consultation_content
-from .utils import get_request_headers, OPENGOV_HOSTS, opengov_url_variants
+from .utils import (LOG_FORMAT, extract_ministry_code_from_url, extract_post_id, normalize_consultation_url,
+                    opengov_url_variants, opengov_article_url_variants)
 
-# Set up logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 
-def normalize_consultation_url(url):
-    """Normalize URL for matching across http/https, opengov host and trailing slash differences."""
-    if not url:
+def find_existing_consultation(session, url, post_id=None):
+    """The stored consultation for a URL: same normalized URL, else same post_id under the same ministry.
+
+    Never trust post_id alone, because the same ?p= id exists under different ministries.
+    """
+    post_id = post_id or extract_post_id(url)
+    if not post_id:
         return None
-    try:
-        parsed = urlparse(url.strip())
-        netloc = parsed.netloc.lower()
-        if netloc in OPENGOV_HOSTS:
-            # www.opengov.gr (older DB rows) and archive.opengov.gr are the same site
-            netloc = "opengov.gr"
-        path = parsed.path or ""
-        if path != "/" and path.endswith("/"):
-            path = path.rstrip("/")
-        query = parsed.query or ""
-        if query:
-            return f"{netloc}{path}?{query}"
-        return f"{netloc}{path}"
-    except Exception:
-        return None
+    candidates = session.query(Consultation).filter_by(post_id=str(post_id)).all()
+    normalized_url = normalize_consultation_url(url)
+    for cons in candidates:
+        if normalize_consultation_url(cons.url) == normalized_url:
+            return cons
+    ministry = extract_ministry_code_from_url(url)
+    ministry_matches = [cons for cons in candidates if extract_ministry_code_from_url(cons.url) == ministry]
+    if len(ministry_matches) > 1:
+        unfinished = [cons for cons in ministry_matches if not cons.is_finished]
+        chosen = (unfinished or ministry_matches)[0]
+        logger.warning(f"Found {len(ministry_matches)} consultations for post_id={post_id} under {ministry}; selected {chosen.url}")
+        return chosen
+    if not ministry_matches and candidates:
+        logger.info(f"post_id={post_id} exists only under other ministries; treating {url} as new")
+    return ministry_matches[0] if ministry_matches else None
 
 
-def extract_ministry_code_from_url(url):
-    """Extract ministry code from URL path, e.g. '/yme/?p=5739' -> 'yme'."""
-    try:
-        parsed = urlparse((url or "").strip())
-        path_parts = [part for part in parsed.path.strip("/").split("/") if part]
-        return path_parts[0].lower() if path_parts else None
-    except Exception:
-        return None
+def store_articles(session, consultation, articles_data):
+    """Add scraped articles and their comments to a consultation, skipping ones already stored.
+
+    Returns (new article count, new comment count) and refreshes consultation.accepted_comments.
+    """
+    article_count = 0
+    comment_count = 0
+    for article_data in articles_data:
+        # Check if article already exists
+        existing_article = session.query(Article).filter(Article.url.in_(opengov_article_url_variants(article_data['url']))).first()
+        
+        if existing_article:
+            article = existing_article
+            logger.info(f"Article already exists: {article.title}")
+        else:
+            logger.info(f"Adding article: {article_data['title']}")
+            article = Article(
+                title=article_data['title'],
+                content=article_data['content'],
+                raw_html=article_data.get('raw_html', ''),  # Include raw HTML content
+                url=article_data['url'],
+                consultation_id=consultation.id,
+                extraction_method=article_data.get('extraction_method')
+            )
+            session.add(article)
+            session.flush()  # Get the ID without committing
+            article_count += 1
+        
+        # Add comments for this article
+        for comment_data in article_data['comments']:
+            # Check if comment already exists (by comment_id and article_id)
+            existing_comment = session.query(Comment).filter_by(
+                comment_id=comment_data['comment_id'],
+                article_id=article.id
+            ).first()
+            
+            if not existing_comment:
+                logger.info(f"Adding comment by {comment_data.get('username', 'ANONYMIZED')}")
+                comment = Comment(
+                    comment_id=comment_data['comment_id'],
+                    username=comment_data.get('username', 'ANONYMIZED'),
+                    date=comment_data['date'],
+                    content=comment_data['content'],
+                    article_id=article.id,
+                    extraction_method=article_data.get('extraction_method')
+                )
+                session.add(comment)
+                comment_count += 1
+    
+    # Calculate accepted_comments as the sum of all comments in articles
+    total_comment_count = session.query(func.count(Comment.id)).join(Article).filter(Article.consultation_id == consultation.id).scalar() or 0
+    logger.info(f"Calculated actual comment count from articles: {total_comment_count}")
+    
+    # Update accepted_comments with the actual count
+    consultation.accepted_comments = total_comment_count
+    return article_count, comment_count
+
+
+def attach_articles(session, consultation, source_url):
+    """Store the articles listed under another post (source_url) in `consultation`, for consultations whose
+    own page lists none. Commits; returns (new article count, new comment count)."""
+    articles_data = scrape_consultation_content(source_url)
+    counts = store_articles(session, consultation, articles_data)
+    session.commit()
+    logger.info(f"Attached {counts[0]} articles and {counts[1]} comments from {source_url} to {consultation.url}")
+    return counts
 
 def scrape_and_store(url, session, selective_update=False, existing_cons=None):
     """Scrape a consultation URL and store all data in the database.
@@ -105,42 +154,7 @@ def scrape_and_store(url, session, selective_update=False, existing_cons=None):
         session.flush()  # Get the ID without committing
     
     # Step 3: Strict consultation existence check
-    post_id = consultation_data["post_id"]
-
-    existing_consultation = None
-    normalized_url = normalize_consultation_url(url)
-
-    # Primary check: normalized URL
-    consultations = session.query(Consultation).all()
-    for cons in consultations:
-        if normalize_consultation_url(cons.url) == normalized_url:
-            existing_consultation = cons
-            logger.info(f"Found existing consultation by URL match: {cons.title}")
-            break
-
-    # Secondary check: post_id + ministry code
-    if existing_consultation is None and post_id:
-        target_ministry = extract_ministry_code_from_url(url)
-        post_id_matches = session.query(Consultation).filter_by(post_id=post_id).all()
-
-        ministry_matches = [
-            cons for cons in post_id_matches
-            if extract_ministry_code_from_url(cons.url) == target_ministry
-        ]
-
-        if len(ministry_matches) == 1:
-            existing_consultation = ministry_matches[0]
-            logger.info(
-                f"Found existing consultation by post_id + ministry match: "
-                f"{existing_consultation.title}"
-            )
-        elif len(ministry_matches) > 1:
-            unfinished = [cons for cons in ministry_matches if not cons.is_finished]
-            existing_consultation = unfinished[0] if unfinished else ministry_matches[0]
-            logger.warning(
-                f"Found {len(ministry_matches)} ministry-matching consultations for "
-                f"post_id={post_id}; selected URL={existing_consultation.url}"
-            )
+    existing_consultation = find_existing_consultation(session, url, consultation_data["post_id"])
 
     # STRICT HANDLING LOGIC
     if existing_consultation is not None:
@@ -238,9 +252,6 @@ def scrape_and_store(url, session, selective_update=False, existing_cons=None):
             logger.info("Consultation status changed from unfinished to finished")
     
     # Step 6: Create article and comment records
-    article_count = 0
-    comment_count = 0
-    
     # If this is a selective update, we only need to track changes to comments
     if selective_update and existing_cons:
         # Track changes to minister messages
@@ -263,56 +274,9 @@ def scrape_and_store(url, session, selective_update=False, existing_cons=None):
             changes['total_comments_change'] = new_total - old_total
             logger.info(f"Total comments changed: {old_total} -> {new_total} (change: {changes['total_comments_change']})")
     
-    for article_data in articles_data:
-        # Check if article already exists
-        existing_article = session.query(Article).filter(Article.url.in_(opengov_url_variants(article_data['url']))).first()
-        
-        if existing_article:
-            article = existing_article
-            logger.info(f"Article already exists: {article.title}")
-        else:
-            logger.info(f"Adding article: {article_data['title']}")
-            article = Article(
-                title=article_data['title'],
-                content=article_data['content'],
-                raw_html=article_data.get('raw_html', ''),  # Include raw HTML content
-                url=article_data['url'],
-                consultation_id=consultation.id
-            )
-            session.add(article)
-            session.flush()  # Get the ID without committing
-            article_count += 1
-        
-        # Add comments for this article
-        for comment_data in article_data['comments']:
-            # Check if comment already exists (by comment_id and article_id)
-            existing_comment = session.query(Comment).filter_by(
-                comment_id=comment_data['comment_id'],
-                article_id=article.id
-            ).first()
-            
-            if not existing_comment:
-                logger.info(f"Adding comment by {comment_data.get('username', 'ANONYMIZED')}")
-                comment = Comment(
-                    comment_id=comment_data['comment_id'],
-                    username=comment_data.get('username', 'ANONYMIZED'),
-                    date=comment_data['date'],
-                    content=comment_data['content'],
-                    article_id=article.id
-                )
-                session.add(comment)
-                comment_count += 1
-                
-                # If we're doing a selective update, track new comments
-                if selective_update:
-                    changes['new_comments'] += 1
-    
-    # Calculate accepted_comments as the sum of all comments in articles
-    total_comment_count = session.query(func.count(Comment.id)).join(Article).filter(Article.consultation_id == consultation.id).scalar() or 0
-    logger.info(f"Calculated actual comment count from articles: {total_comment_count}")
-    
-    # Update accepted_comments with the actual count
-    consultation.accepted_comments = total_comment_count
+    article_count, comment_count = store_articles(session, consultation, articles_data)
+    if selective_update:
+        changes['new_comments'] += comment_count
     
     try:
         session.commit()
@@ -334,25 +298,18 @@ def main():
     parser = argparse.ArgumentParser(description='Scrape consultation data from OpenGov.gr and store in database')
     parser.add_argument('urls', metavar='URL', type=str, nargs='+',
                         help='One or more consultation URLs to scrape')
-    # Use the project root directory for the default database path
-    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    default_db_path = f'sqlite:///{os.path.join(project_root, "deliberation_data_gr.db")}'
-    
-    parser.add_argument('--db-path', type=str, default=default_db_path,
-                        help=f'Database URL (default: {default_db_path})')
-    
+    parser.add_argument('--db-path', type=str, default=DEFAULT_DB_URL,
+                        help=f'Database URL (default: {DEFAULT_DB_URL})')
     args = parser.parse_args()
-    
-    # Initialize the database
+    logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
+
     engine, Session = init_db(args.db_path)
     session = Session()
-    
     try:
         success_count = 0
         for url in args.urls:
-            if scrape_and_store(url, session):
-                success_count += 1
-        
+            ok, _ = scrape_and_store(url, session)
+            success_count += bool(ok)
         logger.info(f"Completed {success_count}/{len(args.urls)} consultations successfully")
     finally:
         session.close()

@@ -8,10 +8,9 @@ import sys
 import os
 import sqlite3
 
-# Add the complete_scraper directory to path
-sys.path.append(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'opengov', 'complete_scraper'))
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from db_models import init_db, Consultation, Document
+from ai4deliberation_pipeline.scraper.db_models import init_db, Consultation, Document
 
 def verify_migration(db_path):
     """Verify that migration was successful."""

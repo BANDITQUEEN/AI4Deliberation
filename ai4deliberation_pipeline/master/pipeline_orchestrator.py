@@ -43,8 +43,6 @@ from scraper.db_models import init_db, Consultation, Article, Document
 # Import the discovery function
 # from scraper.list_consultations import get_all_consultations # No longer directly called, will run script
 
-# For now, we'll disable the discovery functionality to get the basic pipeline working
-# from ..scraper.scrape_to_db import discover_new_consultations
 
 
 @dataclass
@@ -80,7 +78,7 @@ class PipelineOrchestrator:
         
         # Database path
         self.database_path = self.config['database']['default_path']
-        self.list_consultations_script_path = os.path.join(project_root, 'scraper', 'list_consultations.py')
+        self.listing_csv_path = os.path.join(project_root, 'all_consultations.csv')
         
         self.logger.info("Pipeline orchestrator initialized")
     
@@ -178,7 +176,7 @@ class PipelineOrchestrator:
                 if selective_update:
                     # In selective_update mode, scrape_and_store might return True even if no DB changes occur (e.g. finished consultation)
                     # We assume it handles its own commit/flush if changes are made.
-                    self.logger.info(f"Selective update call for {url} reported success. Changes: {scraped_data.get('changes')}")
+                    self.logger.info(f"Selective update call for {url} reported success. Changes: {scraped_data}")
                     session.commit() # Ensure any changes from selective update are committed.
                     return existing_consultation.id # Return the ID of the existing, updated consultation
                 else: # Full scrape (is_new=True or existing_consultation was None)
@@ -493,12 +491,12 @@ class PipelineOrchestrator:
         results: List[PipelineResult] = []
         self.logger.info("Discovering new consultations...")
 
-        # Step 1: Run scraper/list_consultations.py --update
+        # Step 1: Run scraper/list_consultations.py --update (as a module, so its package imports resolve)
         try:
-            self.logger.info(f"Running {self.list_consultations_script_path} --update to refresh all_consultations.csv")
+            self.logger.info(f"Running scraper.list_consultations --update to refresh {self.listing_csv_path}")
             process = subprocess.run(
-                [sys.executable, self.list_consultations_script_path, "--update"],
-                capture_output=True, text=True, check=False, encoding='utf-8' # Added encoding
+                [sys.executable, "-m", "scraper.list_consultations", "--update", "--output", self.listing_csv_path],
+                cwd=project_root, capture_output=True, text=True, check=False, encoding='utf-8'
             )
             if process.returncode != 0:
                 self.logger.error(f"list_consultations.py script failed. STDERR: {process.stderr} STDOUT: {process.stdout}")
@@ -510,7 +508,7 @@ class PipelineOrchestrator:
 
         # Step 2: Read all_consultations.csv
         all_site_consultations_data = []
-        csv_path = os.path.join(project_root, 'all_consultations.csv')
+        csv_path = self.listing_csv_path
         if not os.path.exists(csv_path):
             self.logger.error(f"all_consultations.csv not found at {csv_path}. Cannot proceed.")
             return results

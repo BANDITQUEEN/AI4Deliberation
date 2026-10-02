@@ -1,45 +1,28 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import csv
 import logging
 import re
-import time
-from pathlib import Path
-from random import uniform
-from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-import requests
 from bs4 import BeautifulSoup
 
 from .utils import (
+    REQUEST_DELAY,
     parse_greek_date,
     find_element_with_fallbacks,
     extract_post_id,
     build_absolute_url,
-    get_request_headers,
+    http_get,
+    opengov_url_key,
+    polite_sleep,
+    strip_default_port,
 )
 
-# Set up logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-REQUEST_TIMEOUT = 30
-REQUEST_DELAY = (0.15, 0.25)
-
-HTTP = requests.Session()
-
-
-def http_get(url, allow_redirects=True):
-    """Centralized GET helper with shared session."""
-    response = HTTP.get(
-        url,
-        headers=get_request_headers(),
-        timeout=REQUEST_TIMEOUT,
-        allow_redirects=allow_redirects,
-    )
-    response.raise_for_status()
-    return response
+# extraction_method of the extra article holding comments posted on a consultation's root post
+CONSULTATION_ROOT = 'consultation_root'
 
 
 def set_query_param(url, key, value):
@@ -59,7 +42,7 @@ def set_query_param(url, key, value):
 def fetch_page_soup(url):
     """Fetch a page and return BeautifulSoup plus final URL after redirects."""
     response = http_get(url, allow_redirects=True)
-    return BeautifulSoup(response.content, 'html.parser'), response.url
+    return BeautifulSoup(response.content, 'html.parser'), strip_default_port(response.url)
 
 
 def discover_comment_page_urls(soup, article_url):
@@ -93,10 +76,12 @@ def discover_comment_page_urls(soup, article_url):
 
     max_page = max(page_numbers) if page_numbers else 1
 
-    urls = [article_url]
+    # The bare article URL may show the *last* comment page rather than the first,
+    # so when paginated, fetch every page explicitly via cpage=1..max_page.
     if max_page > 1:
-        for n in range(2, max_page + 1):
-            urls.append(set_query_param(article_url, "cpage", n))
+        urls = [set_query_param(article_url, "cpage", n) for n in range(1, max_page + 1)]
+    else:
+        urls = [article_url]
 
     # deduplicate, preserve order
     seen = set()
@@ -210,13 +195,41 @@ def extract_comments_from_single_page(soup, include_author=False):
     return comments
 
 
+def parse_article_nav(soup, base_url):
+    """Articles listed in a consultation page's navigation, with the comment count shown next to each.
+
+    Returns [{'url', 'title', 'post_id', 'site_comments'}]; 'site_comments' is None when no count is shown.
+    An article page lists its sibling articles but not itself.
+    """
+    consnav_div = find_element_with_fallbacks(soup, ['div#consnav', 'div.navigation'])
+    articles_list = find_element_with_fallbacks(consnav_div, ['ul.other_posts', 'ul.articlesList']) if consnav_div else None
+    entries = []
+    for li in articles_list.find_all('li') if articles_list else []:
+        link = li.find('a', class_='list_comments_link') or li.find('a')
+        if not (link and link.has_attr('href')):
+            continue
+        url = build_absolute_url(base_url, link['href'])
+        count = li.select_one('span.list_comments a')
+        # "1.127 Σχόλια" uses '.' as the thousands separator
+        m = re.search(r'\d[\d.]*', count.get_text()) if count else None
+        entries.append({'url': url, 'title': link.get_text(strip=True), 'post_id': extract_post_id(url),
+                        'site_comments': int(m.group().replace('.', '')) if m else None})
+    return entries
+
+
+def site_comment_counts(soup, base_url):
+    """{article URL key: comment count the site shows} from a consultation page's navigation."""
+    return {opengov_url_key(e['url']): e['site_comments'] for e in parse_article_nav(soup, base_url)
+            if e['site_comments'] is not None}
+
+
 def extract_article_links(url):
     """Extract article links from a consultation page."""
     try:
         logger.info(f"Fetching article list from URL: {url}")
         response = http_get(url, allow_redirects=True)
 
-        final_url = response.url
+        final_url = strip_default_port(response.url)
         if final_url != url:
             logger.info(f"URL was redirected: {url} -> {final_url}")
             url = final_url
@@ -240,26 +253,10 @@ def extract_article_links(url):
             })
             logger.info(f"Found article: {article_title}")
 
-        nav_selectors = ['div#consnav', 'div.navigation']
-        consnav_div = find_element_with_fallbacks(soup, nav_selectors)
-
-        if consnav_div:
-            list_selectors = ['ul.other_posts', 'ul.articlesList']
-            articles_list = find_element_with_fallbacks(consnav_div, list_selectors)
-
-            if articles_list:
-                li_elements = articles_list.find_all('li')
-                logger.info(f"Found {len(li_elements)} article links in navigation")
-
-                for li in li_elements:
-                    try:
-                        link = li.find('a', class_='list_comments_link') or li.find('a')
-                        if link and link.has_attr('href'):
-                            article_url = build_absolute_url(url, link['href'])
-                            article_title = link.get_text(strip=True)
-                            add_article(article_url, article_title)
-                    except Exception as e:
-                        logger.error(f"Error processing article link: {e}")
+        nav_entries = parse_article_nav(soup, url)
+        logger.info(f"Found {len(nav_entries)} article links in navigation")
+        for entry in nav_entries:
+            add_article(entry['url'], entry['title'])
 
         if not articles:
             logger.info("No articles found in navigation, trying content area")
@@ -327,7 +324,7 @@ def scrape_article_content(article_url):
         return None
 
 
-def extract_comments(soup, article_url, delay_range=(0.15, 0.25), include_author=False):
+def extract_comments(soup, article_url, delay_range=REQUEST_DELAY, include_author=False):
     """
     Extract comments from all comment pages of an article.
     Deduplicate by comment_id.
@@ -340,12 +337,10 @@ def extract_comments(soup, article_url, delay_range=(0.15, 0.25), include_author
 
         for i, page_url in enumerate(page_urls):
             try:
-                if i == 0:
+                if page_url == article_url:
                     page_soup = soup
                 else:
-                    delay = uniform(*delay_range)
-                    logger.info(f"Waiting {delay:.2f} seconds before fetching comment page {page_url}")
-                    time.sleep(delay)
+                    polite_sleep(delay_range)
                     page_soup, _ = fetch_page_soup(page_url)
 
                 page_comments = extract_comments_from_single_page(
@@ -372,7 +367,7 @@ def extract_comments(soup, article_url, delay_range=(0.15, 0.25), include_author
         return all_comments
 
 
-def scrape_consultation_content(consultation_url, delay_range=(0.15, 0.25)):
+def scrape_consultation_content(consultation_url, delay_range=REQUEST_DELAY):
     """Scrape all articles and comments from a consultation."""
     try:
         articles_links = extract_article_links(consultation_url)
@@ -381,13 +376,21 @@ def scrape_consultation_content(consultation_url, delay_range=(0.15, 0.25)):
         articles_content = []
         for i, article in enumerate(articles_links):
             if i > 0:
-                delay = uniform(*delay_range)
-                logger.info(f"Waiting {delay:.2f} seconds before next request...")
-                time.sleep(delay)
+                polite_sleep(delay_range)
 
             article_data = scrape_article_content(article['url'])
             if article_data:
                 articles_content.append(article_data)
+
+        # Early consultations also took comments on the root post (the minister's introduction),
+        # which is not one of its own articles; keep those as an extra, tagged article.
+        article_keys = {opengov_url_key(a['url']) for a in articles_links}
+        if opengov_url_key(consultation_url) not in article_keys:
+            root_data = scrape_article_content(consultation_url)
+            if root_data and root_data['comments']:
+                root_data['extraction_method'] = CONSULTATION_ROOT
+                articles_content.append(root_data)
+                logger.info(f"Found {len(root_data['comments'])} comments on the consultation root post")
 
         article_count = len(articles_content)
         comment_count = sum(len(article['comments']) for article in articles_content)
@@ -400,47 +403,8 @@ def scrape_consultation_content(consultation_url, delay_range=(0.15, 0.25)):
         return []
 
 
-def save_comments_to_csv(articles, consultation_url, out_path):
-    """Save all scraped comments to a flat CSV file."""
-    rows = []
-
-    for article in articles:
-        for comment in article.get("comments", []):
-            rows.append({
-                "consultation_url": consultation_url,
-                "article_url": article.get("url"),
-                "article_post_id": article.get("post_id"),
-                "article_title": article.get("title"),
-                "comment_id": comment.get("comment_id"),
-                "comment_date": comment.get("date").isoformat() if comment.get("date") else None,
-                "comment_permalink": comment.get("permalink"),
-                "comment_content": comment.get("content"),
-            })
-
-    out_path = Path(out_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    with open(out_path, "w", encoding="utf-8-sig", newline="") as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=[
-                "consultation_url",
-                "article_url",
-                "article_post_id",
-                "article_title",
-                "comment_id",
-                "comment_date",
-                "comment_permalink",
-                "comment_content",
-            ],
-        )
-        writer.writeheader()
-        writer.writerows(rows)
-
-    logger.info(f"Saved {len(rows)} comments to {out_path}")
-
-
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     test_url = "http://www.opengov.gr/ministryofjustice/?p=18058"
     articles = scrape_consultation_content(test_url)
 
